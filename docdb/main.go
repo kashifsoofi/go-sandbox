@@ -15,8 +15,9 @@ import (
 )
 
 type server struct {
-	db   *pebble.DB
-	port int
+	db      *pebble.DB
+	indexDb *pebble.DB
+	port    int
 }
 
 func newServer(database string, port int) (*server, error) {
@@ -25,7 +26,12 @@ func newServer(database string, port int) (*server, error) {
 		return nil, err
 	}
 
-	return &server{db, port}, nil
+	indexDb, err := pebble.Open(database+".index", &pebble.Options{})
+	if err != nil {
+		return nil, err
+	}
+
+	return &server{db, indexDb, port}, nil
 }
 
 func main() {
@@ -34,6 +40,8 @@ func main() {
 		log.Fatal(err)
 	}
 	defer s.db.Close()
+
+	s.reindex()
 
 	router := httprouter.New()
 	router.POST("/docs", s.addDocument)
@@ -58,6 +66,8 @@ func (s server) addDocument(w http.ResponseWriter, r *http.Request, _ httprouter
 	// New unique id for the document
 	id := uuid.New().String()
 
+	s.index(id, document)
+
 	bs, err := json.Marshal(document)
 	if err != nil {
 		jsonResponse(w, nil, err)
@@ -75,6 +85,21 @@ func (s server) addDocument(w http.ResponseWriter, r *http.Request, _ httprouter
 	}, nil)
 }
 
+func (s server) lookup(pathValue string) ([]string, error) {
+	idsString, closer, err := s.indexDb.Get([]byte(pathValue))
+	if err != nil && err != pebble.ErrNotFound {
+		return nil, fmt.Errorf("Could not look up pathvalue [%#v]: %s", pathValue, err)
+	}
+	if closer != nil {
+		defer closer.Close()
+	}
+
+	if len(idsString) == 0 {
+		return nil, nil
+	}
+	return strings.Split(string(idsString), ","), nil
+}
+
 func (s server) searchDocuments(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 	q, err := parseQuery(r.URL.Query().Get("q"))
 	if err != nil {
@@ -82,24 +107,76 @@ func (s server) searchDocuments(w http.ResponseWriter, r *http.Request, ps httpr
 		return
 	}
 
-	var documents []map[string]any
+	isRange := false
+	idsArgumentCount := map[string]int{}
+	nonRangeArguments := 0
+	for _, argument := range q.ands {
+		if argument.op == "=" {
+			nonRangeArguments++
 
-	iter := s.db.NewIter(nil)
-	defer iter.Close()
+			ids, err := s.lookup(fmt.Sprintf("%s=%v", strings.Join(argument.key, "."), argument.value))
+			if err != nil {
+				jsonResponse(w, nil, err)
+				return
+			}
 
-	for iter.First(); iter.Valid(); iter.Next() {
-		var document map[string]any
-		err = json.Unmarshal(iter.Value(), &document)
-		if err != nil {
-			jsonResponse(w, nil, err)
-			return
+			for _, id := range ids {
+				_, ok := idsArgumentCount[id]
+				if !ok {
+					idsArgumentCount[id] = 0
+				}
+				idsArgumentCount[id]++
+			}
+		} else {
+			isRange = false
 		}
+	}
 
-		if q.match(document) {
-			documents = append(documents, map[string]any{
-				"id":   string(iter.Key()),
-				"body": document,
-			})
+	var idsInAll []string
+	for id, count := range idsArgumentCount {
+		if count == nonRangeArguments {
+			idsInAll = append(idsInAll, id)
+		}
+	}
+
+	var documents []map[string]any
+	if r.URL.Query().Get("skipIndex") == "true" {
+		idsInAll = nil
+	}
+
+	if len(idsInAll) > 0 {
+		for _, id := range idsInAll {
+			document, err := s.getDocumentById([]byte(id))
+			if err != nil {
+				jsonResponse(w, nil, err)
+				return
+			}
+
+			if !isRange || q.match(document) {
+				documents = append(documents, map[string]any{
+					"id":   string(id),
+					"body": document,
+				})
+			}
+		}
+	} else {
+		iter := s.db.NewIter(nil)
+		defer iter.Close()
+
+		for iter.First(); iter.Valid(); iter.Next() {
+			var document map[string]any
+			err = json.Unmarshal(iter.Value(), &document)
+			if err != nil {
+				jsonResponse(w, nil, err)
+				return
+			}
+
+			if q.match(document) {
+				documents = append(documents, map[string]any{
+					"id":   string(iter.Key()),
+					"body": document,
+				})
+			}
 		}
 	}
 
@@ -133,6 +210,82 @@ func (s server) getDocumentById(id []byte) (map[string]any, error) {
 	var document map[string]any
 	err = json.Unmarshal(valBytes, &document)
 	return document, nil
+}
+
+func (s server) reindex() {
+	iter := s.db.NewIter(nil)
+	defer iter.Close()
+
+	for iter.First(); iter.Valid(); iter.Next() {
+		var document map[string]any
+		err := json.Unmarshal(iter.Value(), &document)
+		if err != nil {
+			log.Printf("Unable to parse bad document, %s: %s", string(iter.Key()), err)
+		}
+		s.index(string(iter.Key()), document)
+	}
+}
+
+func (s server) index(id string, document map[string]any) {
+	pv := getPathValues(document, "")
+
+	for _, pathValue := range pv {
+		idsString, closer, err := s.indexDb.Get([]byte(pathValue))
+		if err != nil && err != pebble.ErrNotFound {
+			log.Printf("Could not look up pathvalue [%#v]: %s", document, err)
+		}
+
+		if len(idsString) == 0 {
+			idsString = []byte(id)
+		} else {
+			ids := strings.Split(string(idsString), ",")
+
+			found := false
+			for _, existingId := range ids {
+				if id == existingId {
+					found = true
+				}
+			}
+
+			if !found {
+				idsString = append(idsString, []byte(","+id)...)
+			}
+		}
+
+		if closer != nil {
+			err := closer.Close()
+			if err != nil {
+				log.Printf("Could not close: %s", err)
+			}
+		}
+
+		err = s.indexDb.Set([]byte(pathValue), idsString, pebble.Sync)
+		if err != nil {
+			log.Printf("Could not update index: %s", err)
+		}
+	}
+}
+
+func getPathValues(obj map[string]any, prefix string) []string {
+	var pvs []string
+	for key, val := range obj {
+		switch t := val.(type) {
+		case map[string]any:
+			pvs := append(pvs, getPathValues(t, key)...)
+			continue
+		case []interface{}:
+			// Can't handle arrays
+			continue
+		}
+
+		if prefix != "" {
+			key = prefix + "." + key
+		}
+
+		pvs = append(pvs, fmt.Sprintf("%s=%v", key, val))
+	}
+
+	return pvs
 }
 
 func jsonResponse(w http.ResponseWriter, body map[string]any, err error) {
